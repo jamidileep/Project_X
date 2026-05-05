@@ -51,6 +51,8 @@ GROQ_API_KEY    = "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"
 MISTRAL_API_KEY = "gOnIFRT1ywLiXVFdHvW5MjzHrJnaLq51"
 GEMINI_API_KEY  = "AIzaSyDxxYVJ7X-EIvz7QxRD2f-4pj2YQphL_gE"
 TAVILY_API_KEY  = "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"
+st.write(f"Mistral key starts with: {MISTRAL_API_KEY[:6]}")
+st.write(f"Mistral key length: {len(MISTRAL_API_KEY)}")
 
 os.environ["TAVILY_API_KEY"] = TAVILY_API_KEY
 
