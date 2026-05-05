@@ -19,7 +19,7 @@ from langchain.chat_models import init_chat_model
 from langchain_community.document_loaders import WebBaseLoader
 from langchain_community.vectorstores import FAISS
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_mistralai import MistralAIEmbeddings          # ← CHANGED
+from langchain_mistralai import MistralAIEmbeddings
 from langchain_chroma import Chroma
 
 # ─── LangGraph ────────────────────────────────────────────────────────────────
@@ -44,14 +44,23 @@ from typing_extensions import TypedDict
 from pydantic import BaseModel, Field
 
 # ══════════════════════════════════════════════════════════════════════════════
+# 🔧  HARDCODED API KEYS (for testing only)
+# ══════════════════════════════════════════════════════════════════════════════
+
+GROQ_API_KEY    = "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"
+MISTRAL_API_KEY = "gOnIFRT1ywLiXVFdHvW5MjzHrJnaLq51"
+GEMINI_API_KEY  = "AIzaSyDxxYVJ7X-EIvz7QxRD2f-4pj2YQphL_gE"
+TAVILY_API_KEY  = "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"
+
+os.environ["TAVILY_API_KEY"] = TAVILY_API_KEY
+
+# ══════════════════════════════════════════════════════════════════════════════
 # 🔧  SHARED CONFIG
 # ══════════════════════════════════════════════════════════════════════════════
 
-# EMBED_MODEL constant removed — Mistral uses its own hosted model "mistral-embed"
-
 llm = init_chat_model(
     model="groq:openai/gpt-oss-120b",
-    api_key=os.getenv("llm_api")
+    api_key=GROQ_API_KEY
 )
 
 tavily_tool = TavilySearch(
@@ -120,7 +129,7 @@ def chunks_to_documents(chunks):
 
 def process_images_gemini(images):
     """Summarise extracted PDF images with Gemini Vision."""
-    client = genai.Client(api_key=os.getenv("vm_api"))
+    client = genai.Client(api_key=GEMINI_API_KEY)
     os.makedirs("images", exist_ok=True)
     img_docs = []
     for i, img in enumerate(images):
@@ -145,9 +154,9 @@ def process_images_gemini(images):
 
 
 def create_chroma_store(documents, collection_name):
-    embeddings = MistralAIEmbeddings(                        # ← CHANGED
+    embeddings = MistralAIEmbeddings(
         model="mistral-embed",
-        api_key=os.getenv("mistral_api")
+        api_key=MISTRAL_API_KEY
     )
     return Chroma.from_documents(
         documents=documents,
@@ -165,9 +174,9 @@ def build_url_retriever(url: str):
     docs = WebBaseLoader(url).load()
     splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
     splits = splitter.split_documents(docs)
-    embeddings = MistralAIEmbeddings(                        # ← CHANGED
+    embeddings = MistralAIEmbeddings(
         model="mistral-embed",
-        api_key=os.getenv("mistral_api")
+        api_key=MISTRAL_API_KEY
     )
     vectorstore = FAISS.from_documents(splits, embeddings)
     return vectorstore.as_retriever()
