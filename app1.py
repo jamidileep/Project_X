@@ -2,7 +2,6 @@ import streamlit as st
 import tempfile
 import os
 import io
-import json
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -10,14 +9,13 @@ load_dotenv()
 # LangChain core
 from langchain_core.documents import Document
 from langchain_core.messages import AIMessage, HumanMessage, BaseMessage
-from langchain_core.prompts import ChatPromptTemplate, PromptTemplate
+from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.tools import create_retriever_tool
 from langchain.chat_models import init_chat_model
 
 # Community
 from langchain_community.document_loaders import PyPDFLoader
-from langchain_community.vectorstores import FAISS
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_mistralai import MistralAIEmbeddings
 from langchain_chroma import Chroma
@@ -36,13 +34,17 @@ from PIL import Image as PILImage
 # Gemini
 from google import genai
 
-from typing import Annotated, Sequence, Literal
+from typing import Annotated, Sequence
 from typing_extensions import TypedDict
-from pydantic import BaseModel, Field
 
 # ═══════════════════════════════════════════════════════════════
 # CONFIG
 # ═══════════════════════════════════════════════════════════════
+
+# ✅ validate env keys early
+if not os.getenv("llm_api"):
+    st.error("Missing GROQ API key")
+    st.stop()
 
 llm = init_chat_model(
     model="groq:openai/gpt-oss-120b",
@@ -52,7 +54,7 @@ llm = init_chat_model(
 tavily_tool = TavilySearch(max_results=3)
 
 # ═══════════════════════════════════════════════════════════════
-# PDF TEXT (FIXED)
+# PDF TEXT
 # ═══════════════════════════════════════════════════════════════
 
 def extract_text(file_path):
@@ -83,28 +85,42 @@ def extract_images(file_path):
 
     return images
 
+
 def process_images(images):
-    client = genai.Client(api_key=os.getenv("vm_api"))
+    """SAFE version (won’t crash app)"""
+
+    api_key = os.getenv("vm_api")
+    if not api_key:
+        return []
+
+    client = genai.Client(api_key=api_key)
 
     os.makedirs("images", exist_ok=True)
     docs = []
 
     for i, img in enumerate(images):
-        path = f"images/img_{i}.png"
+        try:
+            path = f"images/img_{i}.png"
 
-        with open(path, "wb") as f:
-            f.write(img["image_bytes"])
+            with open(path, "wb") as f:
+                f.write(img["image_bytes"])
 
-        pil_img = PILImage.open(io.BytesIO(img["image_bytes"]))
+            pil_img = PILImage.open(io.BytesIO(img["image_bytes"]))
 
-        res = client.models.generate_content(
-            model="gemini-2.5-flash",
-            contents=[pil_img, "Describe this image"]
-        )
+            res = client.models.generate_content(
+                model="gemini-2.5-flash",
+                contents=[pil_img, "Describe this image"]
+            )
+
+            text = res.text if res else "No description"
+
+        except Exception as e:
+            text = f"Image processing failed: {str(e)}"
+            path = None
 
         docs.append(
             Document(
-                page_content=res.text,
+                page_content=text,
                 metadata={"image_path": path}
             )
         )
@@ -117,7 +133,7 @@ def process_images(images):
 
 def create_store(docs, name):
     if not docs:
-        raise ValueError("No documents to embed")
+        return None
 
     embeddings = MistralAIEmbeddings(
         model="mistral-embed",
@@ -138,6 +154,7 @@ class State(TypedDict):
     messages: Annotated[Sequence[BaseMessage], lambda x, y: list(x)+list(y)]
     images: list
 
+
 def build_graph(text_tool, image_tool=None):
     tools = [text_tool, tavily_tool]
     if image_tool:
@@ -152,8 +169,8 @@ def build_graph(text_tool, image_tool=None):
         ctx = state["messages"][-1].content
 
         prompt = ChatPromptTemplate.from_messages([
-            ("system", "Answer concisely"),
-            ("human", "Context:{context}\nQ:{q}")
+            ("system", "Answer briefly using context"),
+            ("human", "Context:\n{context}\n\nQuestion:\n{q}")
         ])
 
         chain = prompt | llm | StrOutputParser()
@@ -195,20 +212,33 @@ if file and st.button("Process"):
         st.error("❌ PDF text extraction failed")
         st.stop()
 
-    with st.spinner("Images..."):
+    with st.spinner("Processing Images..."):
         imgs = extract_images(path)
         img_docs = process_images(imgs)
 
     with st.spinner("Building DB..."):
         text_db = create_store(text_docs, "text")
-        img_db = create_store(img_docs, "img") if img_docs else None
+        img_db = create_store(img_docs, "img")
 
-    text_tool = create_retriever_tool(text_db.as_retriever(), "pdf")
-    img_tool = create_retriever_tool(img_db.as_retriever(), "img") if img_db else None
+    # ✅ FIXED HERE
+    text_tool = create_retriever_tool(
+        text_db.as_retriever(),
+        name="pdf_retriever",
+        description="Retrieve information from uploaded PDF"
+    )
+
+    img_tool = None
+    if img_db:
+        img_tool = create_retriever_tool(
+            img_db.as_retriever(),
+            name="image_retriever",
+            description="Retrieve image-related information from PDF"
+        )
 
     st.session_state.graph = build_graph(text_tool, img_tool)
-    st.success("Ready!")
+    st.success("✅ Ready!")
 
+# CHAT
 if "graph" in st.session_state:
     q = st.text_input("Ask")
 
