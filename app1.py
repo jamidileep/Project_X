@@ -11,8 +11,18 @@ load_dotenv()
 # LangChain Core
 # ─────────────────────────────────────────────────────────────
 from langchain_core.documents import Document
-from langchain_core.messages import AIMessage, HumanMessage, BaseMessage
-from langchain_core.prompts import ChatPromptTemplate, PromptTemplate
+from langchain_core.messages import (
+    AIMessage,
+    HumanMessage,
+    BaseMessage,
+    ToolMessage
+)
+
+from langchain_core.prompts import (
+    ChatPromptTemplate,
+    PromptTemplate
+)
+
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.tools import create_retriever_tool
 
@@ -63,7 +73,7 @@ from typing_extensions import TypedDict
 from pydantic import BaseModel, Field
 
 # ═════════════════════════════════════════════════════════════
-# CONFIG
+# PAGE CONFIG
 # ═════════════════════════════════════════════════════════════
 
 st.set_page_config(
@@ -72,10 +82,21 @@ st.set_page_config(
     layout="wide"
 )
 
+st.title("🤖 Multi Modal Agentic RAG Chatbot")
+st.caption("PDF + URL + Image Retrieval + Agentic RAG")
+
+# ═════════════════════════════════════════════════════════════
+# LLM
+# ═════════════════════════════════════════════════════════════
+
 llm = init_chat_model(
     model="groq:openai/gpt-oss-120b",
     api_key=os.getenv("llm_api")
 )
+
+# ═════════════════════════════════════════════════════════════
+# TAVILY
+# ═════════════════════════════════════════════════════════════
 
 tavily_tool = TavilySearch(
     max_results=3,
@@ -83,8 +104,19 @@ tavily_tool = TavilySearch(
     include_answer=True,
     include_images=True,
     name="tavily_search",
-    description="Search current web information"
+    description="Search realtime web information"
 )
+
+# ═════════════════════════════════════════════════════════════
+# EMBEDDINGS
+# ═════════════════════════════════════════════════════════════
+
+def get_embeddings():
+
+    return MistralAIEmbeddings(
+        model="mistral-embed",
+        api_key=os.getenv("mistral_api")
+    )
 
 # ═════════════════════════════════════════════════════════════
 # PDF TEXT EXTRACTION
@@ -92,16 +124,44 @@ tavily_tool = TavilySearch(
 
 def extract_pdf_text(file_path):
 
-    loader = PyPDFLoader(file_path)
+    try:
 
-    docs = loader.load()
+        loader = PyPDFLoader(file_path)
 
-    splitter = RecursiveCharacterTextSplitter(
-        chunk_size=1000,
-        chunk_overlap=200
-    )
+        docs = loader.load()
 
-    return splitter.split_documents(docs)
+        if not docs:
+            return []
+
+        splitter = RecursiveCharacterTextSplitter(
+            chunk_size=1000,
+            chunk_overlap=200
+        )
+
+        splits = splitter.split_documents(docs)
+
+        clean_docs = []
+
+        for d in splits:
+
+            text = d.page_content.strip()
+
+            if len(text) > 20:
+
+                clean_docs.append(
+                    Document(
+                        page_content=text,
+                        metadata=d.metadata
+                    )
+                )
+
+        return clean_docs
+
+    except Exception as e:
+
+        st.error(f"PDF extraction failed: {e}")
+
+        return []
 
 # ═════════════════════════════════════════════════════════════
 # IMAGE EXTRACTION
@@ -111,29 +171,40 @@ def extract_images(file_path):
 
     images = []
 
-    doc = fitz.open(file_path)
+    try:
 
-    for page_num in range(len(doc)):
+        doc = fitz.open(file_path)
 
-        for img in doc[page_num].get_images(full=True):
+        for page_num in range(len(doc)):
 
-            base_image = doc.extract_image(img[0])
+            for img in doc[page_num].get_images(full=True):
 
-            images.append({
-                "page": page_num,
-                "image_bytes": base_image["image"],
-                "ext": base_image["ext"]
-            })
+                try:
+
+                    base_image = doc.extract_image(img[0])
+
+                    images.append({
+                        "page": page_num,
+                        "image_bytes": base_image["image"],
+                        "ext": base_image["ext"]
+                    })
+
+                except:
+                    pass
+
+    except Exception as e:
+
+        print("Image extraction error:", e)
 
     return images
 
 # ═════════════════════════════════════════════════════════════
-# IMAGE SUMMARIZATION
+# GEMINI IMAGE PROCESSING
 # ═════════════════════════════════════════════════════════════
 
 def process_images_gemini(images):
 
-    if len(images) == 0:
+    if not images:
         return []
 
     client = genai.Client(
@@ -163,24 +234,34 @@ def process_images_gemini(images):
                 model="gemini-2.5-flash",
                 contents=[
                     pil_img,
-                    "Describe this image in detail including diagrams, flowcharts, labels and meaning"
+                    "Describe this image in detail including diagrams, labels, equations, architecture and meaning"
                 ]
             )
 
-            text = response.text if response.text else "No image description"
+            text = ""
 
-            docs.append(
-                Document(
-                    page_content=text,
-                    metadata={
-                        "page": img["page"],
-                        "image_path": image_path
-                    }
+            try:
+                text = response.text
+            except:
+                text = "No description"
+
+            if text:
+
+                docs.append(
+                    Document(
+                        page_content=text,
+                        metadata={
+                            "page": img["page"],
+                            "image_path": image_path
+                        }
+                    )
                 )
-            )
 
         except Exception as e:
-            print("Image processing failed:", e)
+
+            print("Gemini image failed:", e)
+
+            continue
 
     return docs
 
@@ -188,22 +269,24 @@ def process_images_gemini(images):
 # VECTOR STORE
 # ═════════════════════════════════════════════════════════════
 
-def get_embeddings():
-
-    return MistralAIEmbeddings(
-        model="mistral-embed",
-        api_key=os.getenv("mistral_api")
-    )
-
 def create_chroma_store(documents, collection_name):
 
-    if not documents:
-        raise ValueError("No documents to embed")
+    valid_docs = []
+
+    for d in documents:
+
+        if d.page_content and len(d.page_content.strip()) > 5:
+
+            valid_docs.append(d)
+
+    if len(valid_docs) == 0:
+
+        raise ValueError("No valid documents found")
 
     embeddings = get_embeddings()
 
     return Chroma.from_documents(
-        documents=documents,
+        documents=valid_docs,
         embedding=embeddings,
         collection_name=collection_name
     )
@@ -225,10 +308,20 @@ def build_url_retriever(url):
 
     splits = splitter.split_documents(docs)
 
+    clean_docs = []
+
+    for d in splits:
+
+        text = d.page_content.strip()
+
+        if len(text) > 20:
+
+            clean_docs.append(d)
+
     embeddings = get_embeddings()
 
     vectorstore = FAISS.from_documents(
-        splits,
+        clean_docs,
         embeddings
     )
 
@@ -278,16 +371,32 @@ def build_graph(pdf_tool, image_tool=None):
 
     def grade_documents(state):
 
-        class Grade(BaseModel):
+        try:
 
-            binary_score: str = Field(
-                description="yes or no"
-            )
+            class Grade(BaseModel):
 
-        grader = llm.with_structured_output(Grade)
+                binary_score: str = Field(
+                    description="yes or no"
+                )
 
-        prompt = PromptTemplate(
-            template="""
+            grader = llm.with_structured_output(Grade)
+
+            question = state["messages"][0].content
+
+            docs = ""
+
+            for msg in reversed(state["messages"]):
+
+                if isinstance(msg, ToolMessage):
+
+                    docs = str(msg.content)
+
+                    break
+
+            docs = docs[:4000]
+
+            prompt = PromptTemplate(
+                template="""
 You are grading relevance.
 
 Document:
@@ -296,29 +405,35 @@ Document:
 Question:
 {question}
 
-Answer yes or no.
+Reply only:
+yes
+or
+no
 """,
-            input_variables=[
-                "context",
-                "question"
-            ]
-        )
+                input_variables=[
+                    "context",
+                    "question"
+                ]
+            )
 
-        chain = prompt | grader
+            chain = prompt | grader
 
-        question = state["messages"][0].content
+            result = chain.invoke({
+                "question": question,
+                "context": docs
+            })
 
-        docs = state["messages"][-1].content
+            if result.binary_score.lower() == "yes":
 
-        result = chain.invoke({
-            "question": question,
-            "context": docs
-        })
+                return "generate"
 
-        if result.binary_score.lower() == "yes":
+            return "rewrite"
+
+        except Exception as e:
+
+            print("Grading failed:", e)
+
             return "generate"
-
-        return "rewrite"
 
     # ─────────────────────────────────────────
 
@@ -346,33 +461,54 @@ Rewrite this question more clearly:
 
         question = state["messages"][0].content
 
-        docs = state["messages"][-1].content
+        context = ""
 
-        context = docs
+        tool_name = "unknown"
 
         images = []
 
-        tool_name = "unknown"
+        # tool name
 
         for msg in state["messages"]:
 
             if hasattr(msg, "tool_calls") and msg.tool_calls:
 
-                tool_name = msg.tool_calls[0]["name"]
+                try:
+
+                    tool_name = msg.tool_calls[0]["name"]
+
+                except:
+                    pass
+
+        # get tool content safely
+
+        for msg in reversed(state["messages"]):
+
+            if isinstance(msg, ToolMessage):
+
+                context = str(msg.content)
+
+                break
+
+        context = context[:12000]
+
+        # tavily json parsing
 
         try:
 
-            docs_json = json.loads(docs)
+            docs_json = json.loads(context)
 
-            context = docs_json.get(
-                "answer",
-                docs
-            )
+            if isinstance(docs_json, dict):
 
-            images = docs_json.get(
-                "images",
-                []
-            )
+                context = docs_json.get(
+                    "answer",
+                    context
+                )
+
+                images = docs_json.get(
+                    "images",
+                    []
+                )
 
         except:
             pass
@@ -380,11 +516,23 @@ Rewrite this question more clearly:
         prompt = ChatPromptTemplate.from_messages([
             (
                 "system",
-                "Answer clearly and concisely using only provided context"
+                """
+You are an expert AI assistant.
+
+Answer clearly using ONLY the provided context.
+
+Keep answers concise and accurate.
+"""
             ),
             (
                 "human",
-                "Context:\n{context}\n\nQuestion:\n{question}"
+                """
+Context:
+{context}
+
+Question:
+{question}
+"""
             )
         ])
 
@@ -411,7 +559,10 @@ Rewrite this question more clearly:
 
     wf = StateGraph(AgentState)
 
-    wf.add_node("agent", agent)
+    wf.add_node(
+        "agent",
+        agent
+    )
 
     wf.add_node(
         "retrieve",
@@ -460,7 +611,7 @@ Rewrite this question more clearly:
     return wf.compile()
 
 # ═════════════════════════════════════════════════════════════
-# IMAGE DETECTION
+# IMAGE QUERY DETECTION
 # ═════════════════════════════════════════════════════════════
 
 IMAGE_KEYWORDS = {
@@ -471,7 +622,9 @@ IMAGE_KEYWORDS = {
     "figure",
     "visual",
     "graph",
-    "plot"
+    "plot",
+    "show images",
+    "with images"
 }
 
 def wants_images(query):
@@ -487,11 +640,7 @@ def wants_images(query):
 # QUERY RUNNER
 # ═════════════════════════════════════════════════════════════
 
-def run_query(
-    query,
-    graph,
-    image_retriever=None
-):
+def run_query(query, graph, image_retriever=None):
 
     result = graph.invoke({
         "messages": [
@@ -512,6 +661,8 @@ def run_query(
         "unknown"
     )
 
+    # retrieve pdf images
+
     if image_retriever and wants_images(query):
 
         try:
@@ -525,33 +676,18 @@ def run_query(
                 )
 
                 if path and path not in images:
+
                     images.append(path)
 
-        except:
-            pass
+        except Exception as e:
+
+            print("Image retriever failed:", e)
 
     return answer, images, tool_used
 
 # ═════════════════════════════════════════════════════════════
-# UI
+# SESSION STATE
 # ═════════════════════════════════════════════════════════════
-
-st.title("🤖 Multi Modal Agentic RAG Chatbot")
-
-st.caption(
-    "PDF + URL + Image Retrieval + Agentic RAG"
-)
-
-source_mode = st.radio(
-    "Choose Input Source",
-    [
-        "📄 PDF Upload",
-        "🌐 Web URL"
-    ],
-    horizontal=True
-)
-
-# session state
 
 for key in [
     "graph",
@@ -564,6 +700,19 @@ for key in [
 st.session_state.setdefault(
     "ready",
     False
+)
+
+# ═════════════════════════════════════════════════════════════
+# SOURCE MODE
+# ═════════════════════════════════════════════════════════════
+
+source_mode = st.radio(
+    "Choose Input Source",
+    [
+        "📄 PDF Upload",
+        "🌐 Web URL"
+    ],
+    horizontal=True
 )
 
 # ═════════════════════════════════════════════════════════════
@@ -604,7 +753,7 @@ if source_mode == "📄 PDF Upload":
         if len(text_docs) == 0:
 
             st.error(
-                "❌ PDF extraction failed"
+                "❌ No text extracted from PDF"
             )
 
             st.stop()
@@ -639,7 +788,6 @@ if source_mode == "📄 PDF Upload":
                 search_kwargs={"k": 5}
             )
 
-            img_db = None
             image_retriever = None
 
             if img_docs:
@@ -674,7 +822,7 @@ if source_mode == "📄 PDF Upload":
 
         # ─────────────────────────────────────
 
-        with st.spinner("Building Agentic RAG Graph..."):
+        with st.spinner("Building graph..."):
 
             st.session_state["graph"] = build_graph(
                 pdf_tool,
@@ -711,7 +859,7 @@ else:
             description=f"Retrieve information from {url}"
         )
 
-        with st.spinner("Building Graph..."):
+        with st.spinner("Building graph..."):
 
             st.session_state["graph"] = build_graph(
                 url_tool
@@ -751,6 +899,8 @@ if st.session_state.get("ready"):
 
         st.write(f"### 🛠️ Tool Used: {tool_used}")
 
+        # images
+
         if images:
 
             st.write("## 🖼️ Related Images")
@@ -763,16 +913,23 @@ if st.session_state.get("ready"):
 
                 with cols[i % 3]:
 
-                    if img.startswith("http"):
+                    try:
 
-                        st.image(
-                            img,
-                            use_container_width=True
-                        )
+                        if isinstance(img, str):
 
-                    elif os.path.exists(img):
+                            if img.startswith("http"):
 
-                        st.image(
-                            img,
-                            use_container_width=True
-                        )
+                                st.image(
+                                    img,
+                                    use_container_width=True
+                                )
+
+                            elif os.path.exists(img):
+
+                                st.image(
+                                    img,
+                                    use_container_width=True
+                                )
+
+                    except:
+                        pass
