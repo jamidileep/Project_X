@@ -21,7 +21,11 @@ from langchain.chat_models import init_chat_model
 # ─────────────────────────────────────────────────────────────
 # Community
 # ─────────────────────────────────────────────────────────────
-from langchain_community.document_loaders import WebBaseLoader
+from langchain_community.document_loaders import (
+    PyPDFLoader,
+    WebBaseLoader
+)
+
 from langchain_community.vectorstores import FAISS
 
 from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -41,11 +45,8 @@ from langgraph.prebuilt import ToolNode, tools_condition
 from langchain_tavily import TavilySearch
 
 # ─────────────────────────────────────────────────────────────
-# PDF + Images
+# PDF / Images
 # ─────────────────────────────────────────────────────────────
-from unstructured.partition.pdf import partition_pdf
-from unstructured.chunking.title import chunk_by_title
-
 import fitz
 from PIL import Image as PILImage
 
@@ -66,7 +67,7 @@ from pydantic import BaseModel, Field
 # ═════════════════════════════════════════════════════════════
 
 st.set_page_config(
-    page_title="Multi Modal Agentic RAG Chatbot",
+    page_title="Multi Modal Agentic RAG",
     page_icon="🤖",
     layout="wide"
 )
@@ -82,22 +83,31 @@ tavily_tool = TavilySearch(
     include_answer=True,
     include_images=True,
     name="tavily_search",
-    description=(
-        "Use this tool ONLY if answer is not found "
-        "inside uploaded PDF or URL."
-    ),
+    description="Search current web information"
 )
 
 # ═════════════════════════════════════════════════════════════
-# PDF HELPERS
+# PDF TEXT EXTRACTION
 # ═════════════════════════════════════════════════════════════
 
-def partition_document(file_path: str):
+def extract_pdf_text(file_path):
 
-    elements = partition_pdf(
-        filename=file_path,
-        strategy="fast"
+    loader = PyPDFLoader(file_path)
+
+    docs = loader.load()
+
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=1000,
+        chunk_overlap=200
     )
+
+    return splitter.split_documents(docs)
+
+# ═════════════════════════════════════════════════════════════
+# IMAGE EXTRACTION
+# ═════════════════════════════════════════════════════════════
+
+def extract_images(file_path):
 
     images = []
 
@@ -112,72 +122,19 @@ def partition_document(file_path: str):
             images.append({
                 "page": page_num,
                 "image_bytes": base_image["image"],
-                "ext": base_image["ext"],
+                "ext": base_image["ext"]
             })
 
-    return elements, images
-
-
-def flatten_elements(elements):
-
-    flat = []
-
-    for el in elements:
-
-        if isinstance(el, list):
-            flat.extend(flatten_elements(el))
-        else:
-            flat.append(el)
-
-    return flat
-
-
-def batch_chunking(elements):
-
-    all_chunks = []
-
-    for i in range(0, len(elements), 50):
-
-        batch = elements[i : i + 50]
-
-        chunks = chunk_by_title(
-            batch,
-            max_characters=1200,
-            new_after_n_chars=800,
-            combine_text_under_n_chars=200,
-        )
-
-        all_chunks.extend(chunks)
-
-    texts = [
-        chunk.text if hasattr(chunk, "text") else str(chunk)
-        for chunk in all_chunks
-    ]
-
-    splitter = RecursiveCharacterTextSplitter(
-        chunk_size=800,
-        chunk_overlap=150
-    )
-
-    return splitter.create_documents(texts)
-
-
-def chunks_to_documents(chunks):
-
-    return [
-        Document(
-            page_content=c.page_content,
-            metadata={"source": "pdf"}
-        )
-        for c in chunks
-    ]
-
+    return images
 
 # ═════════════════════════════════════════════════════════════
-# GEMINI IMAGE PROCESSING
+# IMAGE SUMMARIZATION
 # ═════════════════════════════════════════════════════════════
 
 def process_images_gemini(images):
+
+    if len(images) == 0:
+        return []
 
     client = genai.Client(
         api_key=os.getenv("vm_api")
@@ -185,7 +142,7 @@ def process_images_gemini(images):
 
     os.makedirs("images", exist_ok=True)
 
-    img_docs = []
+    docs = []
 
     for i, img in enumerate(images):
 
@@ -200,42 +157,32 @@ def process_images_gemini(images):
 
             pil_img = PILImage.open(
                 io.BytesIO(img["image_bytes"])
-            ).convert("RGB")
-
-            pil_img.thumbnail((1024, 1024))
+            )
 
             response = client.models.generate_content(
                 model="gemini-2.5-flash",
                 contents=[
                     pil_img,
-                    (
-                        "Describe this image in detail. "
-                        "Explain diagrams, architecture, "
-                        "labels, charts, flowcharts and visuals."
-                    ),
-                ],
+                    "Describe this image in detail including diagrams, flowcharts, labels and meaning"
+                ]
             )
 
-            text = getattr(response, "text", "")
+            text = response.text if response.text else "No image description"
 
-            if not text:
-                text = "No description generated."
-
-            img_docs.append(
+            docs.append(
                 Document(
                     page_content=text,
                     metadata={
                         "page": img["page"],
-                        "image_path": image_path,
-                    },
+                        "image_path": image_path
+                    }
                 )
             )
 
         except Exception as e:
-            print(f"Gemini Error: {e}")
+            print("Image processing failed:", e)
 
-    return img_docs
-
+    return docs
 
 # ═════════════════════════════════════════════════════════════
 # VECTOR STORE
@@ -248,25 +195,28 @@ def get_embeddings():
         api_key=os.getenv("mistral_api")
     )
 
-
 def create_chroma_store(documents, collection_name):
+
+    if not documents:
+        raise ValueError("No documents to embed")
 
     embeddings = get_embeddings()
 
     return Chroma.from_documents(
         documents=documents,
         embedding=embeddings,
-        collection_name=collection_name,
+        collection_name=collection_name
     )
-
 
 # ═════════════════════════════════════════════════════════════
 # URL RETRIEVER
 # ═════════════════════════════════════════════════════════════
 
-def build_url_retriever(url: str):
+def build_url_retriever(url):
 
-    docs = WebBaseLoader(url).load()
+    loader = WebBaseLoader(url)
+
+    docs = loader.load()
 
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=1000,
@@ -284,9 +234,8 @@ def build_url_retriever(url: str):
 
     return vectorstore.as_retriever()
 
-
 # ═════════════════════════════════════════════════════════════
-# GRAPH
+# AGENT STATE
 # ═════════════════════════════════════════════════════════════
 
 class AgentState(TypedDict):
@@ -297,22 +246,23 @@ class AgentState(TypedDict):
     ]
 
     images: list
+
     tool_used: str
 
+# ═════════════════════════════════════════════════════════════
+# GRAPH
+# ═════════════════════════════════════════════════════════════
 
-def build_graph(
-    retriever_tool_obj,
-    img_retriever_tool_obj=None
-):
+def build_graph(pdf_tool, image_tool=None):
 
-    tools = [retriever_tool_obj, tavily_tool]
+    tools = [pdf_tool, tavily_tool]
 
-    if img_retriever_tool_obj:
-        tools.append(img_retriever_tool_obj)
+    if image_tool:
+        tools.append(image_tool)
 
     # ─────────────────────────────────────────
 
-    def agent(state: AgentState):
+    def agent(state):
 
         model = llm.bind_tools(tools)
 
@@ -320,13 +270,13 @@ def build_graph(
             state["messages"]
         )
 
-        return {"messages": [response]}
+        return {
+            "messages": [response]
+        }
 
     # ─────────────────────────────────────────
 
-    def grade_documents(
-        state: AgentState
-    ) -> Literal["generate", "rewrite"]:
+    def grade_documents(state):
 
         class Grade(BaseModel):
 
@@ -337,19 +287,27 @@ def build_graph(
         grader = llm.with_structured_output(Grade)
 
         prompt = PromptTemplate(
-            template=(
-                "Check whether retrieved docs "
-                "are relevant.\n\n"
-                "Question:\n{question}\n\n"
-                "Docs:\n{context}\n\n"
-                "Answer yes or no."
-            ),
-            input_variables=["question", "context"],
+            template="""
+You are grading relevance.
+
+Document:
+{context}
+
+Question:
+{question}
+
+Answer yes or no.
+""",
+            input_variables=[
+                "context",
+                "question"
+            ]
         )
 
         chain = prompt | grader
 
         question = state["messages"][0].content
+
         docs = state["messages"][-1].content
 
         result = chain.invoke({
@@ -364,49 +322,54 @@ def build_graph(
 
     # ─────────────────────────────────────────
 
-    def rewrite(state: AgentState):
+    def rewrite(state):
 
         question = state["messages"][0].content
 
         msg = HumanMessage(
-            content=(
-                "Rewrite this query more clearly:\n\n"
-                f"{question}"
-            )
+            content=f"""
+Rewrite this question more clearly:
+
+{question}
+"""
         )
 
         response = llm.invoke([msg])
 
-        return {"messages": [response]}
+        return {
+            "messages": [response]
+        }
 
     # ─────────────────────────────────────────
 
-    def generate(state: AgentState):
+    def generate(state):
 
         question = state["messages"][0].content
 
-        tool_name = None
+        docs = state["messages"][-1].content
+
+        context = docs
+
+        images = []
+
+        tool_name = "unknown"
 
         for msg in state["messages"]:
 
             if hasattr(msg, "tool_calls") and msg.tool_calls:
+
                 tool_name = msg.tool_calls[0]["name"]
-
-        docs_raw = state["messages"][-1].content
-
-        context = docs_raw
-        tavily_images = []
 
         try:
 
-            docs_json = json.loads(docs_raw)
+            docs_json = json.loads(docs)
 
             context = docs_json.get(
                 "answer",
-                docs_raw
+                docs
             )
 
-            tavily_images = docs_json.get(
+            images = docs_json.get(
                 "images",
                 []
             )
@@ -417,49 +380,31 @@ def build_graph(
         prompt = ChatPromptTemplate.from_messages([
             (
                 "system",
-                (
-                    "Answer clearly and concisely "
-                    "using only given context."
-                )
+                "Answer clearly and concisely using only provided context"
             ),
             (
                 "human",
                 "Context:\n{context}\n\nQuestion:\n{question}"
-            ),
+            )
         ])
 
-        chain = prompt | llm | StrOutputParser()
+        chain = (
+            prompt
+            | llm
+            | StrOutputParser()
+        )
 
         answer = chain.invoke({
             "context": context,
             "question": question
         })
 
-        retrieved_images = []
-
-        if (
-            tool_name == retriever_tool_obj.name
-            and img_retriever_tool_obj
-        ):
-
-            img_docs = img_retriever_tool_obj.func(question)
-
-            for d in img_docs:
-
-                path = d.metadata.get("image_path")
-
-                if path:
-                    retrieved_images.append(path)
-
-        else:
-            retrieved_images = tavily_images
-
         return {
             "messages": [
                 AIMessage(content=answer)
             ],
-            "images": retrieved_images,
-            "tool_used": tool_name or "unknown",
+            "images": images,
+            "tool_used": tool_name
         }
 
     # ─────────────────────────────────────────
@@ -467,11 +412,26 @@ def build_graph(
     wf = StateGraph(AgentState)
 
     wf.add_node("agent", agent)
-    wf.add_node("retrieve", ToolNode(tools))
-    wf.add_node("rewrite", rewrite)
-    wf.add_node("generate", generate)
 
-    wf.add_edge(START, "agent")
+    wf.add_node(
+        "retrieve",
+        ToolNode(tools)
+    )
+
+    wf.add_node(
+        "rewrite",
+        rewrite
+    )
+
+    wf.add_node(
+        "generate",
+        generate
+    )
+
+    wf.add_edge(
+        START,
+        "agent"
+    )
 
     wf.add_conditional_edges(
         "agent",
@@ -487,11 +447,17 @@ def build_graph(
         grade_documents
     )
 
-    wf.add_edge("generate", END)
-    wf.add_edge("rewrite", "agent")
+    wf.add_edge(
+        "generate",
+        END
+    )
+
+    wf.add_edge(
+        "rewrite",
+        "agent"
+    )
 
     return wf.compile()
-
 
 # ═════════════════════════════════════════════════════════════
 # IMAGE DETECTION
@@ -501,23 +467,21 @@ IMAGE_KEYWORDS = {
     "diagram",
     "architecture",
     "flowchart",
-    "visual",
     "image",
     "figure",
+    "visual",
     "graph",
-    "plot",
-    "show"
+    "plot"
 }
 
 def wants_images(query):
 
-    query = query.lower()
+    q = query.lower()
 
     return any(
-        kw in query
-        for kw in IMAGE_KEYWORDS
+        word in q
+        for word in IMAGE_KEYWORDS
     )
-
 
 # ═════════════════════════════════════════════════════════════
 # QUERY RUNNER
@@ -538,7 +502,10 @@ def run_query(
 
     answer = result["messages"][-1].content
 
-    images = result.get("images", [])
+    images = result.get(
+        "images",
+        []
+    )
 
     tool_used = result.get(
         "tool_used",
@@ -547,20 +514,26 @@ def run_query(
 
     if image_retriever and wants_images(query):
 
-        img_docs = image_retriever.invoke(query)
+        try:
 
-        for d in img_docs:
+            img_docs = image_retriever.invoke(query)
 
-            path = d.metadata.get("image_path")
+            for d in img_docs:
 
-            if path and path not in images:
-                images.append(path)
+                path = d.metadata.get(
+                    "image_path"
+                )
+
+                if path and path not in images:
+                    images.append(path)
+
+        except:
+            pass
 
     return answer, images, tool_used
 
-
 # ═════════════════════════════════════════════════════════════
-# STREAMLIT UI
+# UI
 # ═════════════════════════════════════════════════════════════
 
 st.title("🤖 Multi Modal Agentic RAG Chatbot")
@@ -571,18 +544,27 @@ st.caption(
 
 source_mode = st.radio(
     "Choose Input Source",
-    ["📄 PDF Upload", "🌐 Web URL"],
+    [
+        "📄 PDF Upload",
+        "🌐 Web URL"
+    ],
     horizontal=True
 )
+
+# session state
 
 for key in [
     "graph",
     "image_retriever",
     "ready"
 ]:
-
     if key not in st.session_state:
         st.session_state[key] = None
+
+st.session_state.setdefault(
+    "ready",
+    False
+)
 
 # ═════════════════════════════════════════════════════════════
 # PDF MODE
@@ -595,7 +577,7 @@ if source_mode == "📄 PDF Upload":
         type="pdf"
     )
 
-    if uploaded_file and st.button("⚙️ Process PDF"):
+    if uploaded_file and st.button("Process PDF"):
 
         with tempfile.NamedTemporaryFile(
             delete=False,
@@ -610,21 +592,42 @@ if source_mode == "📄 PDF Upload":
 
         with st.spinner("Reading PDF..."):
 
-            elements, raw_images = partition_document(
+            text_docs = extract_pdf_text(
                 file_path
             )
 
-            elements = flatten_elements(elements)
+        st.write(
+            "Chunks:",
+            len(text_docs)
+        )
 
-            chunks = batch_chunking(elements)
+        if len(text_docs) == 0:
 
-            text_docs = chunks_to_documents(chunks)
+            st.error(
+                "❌ PDF extraction failed"
+            )
 
-        st.write("Chunks:", len(text_docs))
+            st.stop()
 
         # ─────────────────────────────────────
 
-        with st.spinner("Building Text DB..."):
+        with st.spinner("Extracting images..."):
+
+            raw_images = extract_images(
+                file_path
+            )
+
+        # ─────────────────────────────────────
+
+        with st.spinner("Processing images with Gemini..."):
+
+            img_docs = process_images_gemini(
+                raw_images
+            )
+
+        # ─────────────────────────────────────
+
+        with st.spinner("Building vector DB..."):
 
             text_db = create_chroma_store(
                 text_docs,
@@ -636,78 +639,49 @@ if source_mode == "📄 PDF Upload":
                 search_kwargs={"k": 5}
             )
 
-        # ─────────────────────────────────────
+            img_db = None
+            image_retriever = None
 
-        with st.spinner("Processing Images..."):
+            if img_docs:
 
-            try:
-                img_docs = process_images_gemini(
-                    raw_images
-                )
-
-            except Exception as e:
-
-                st.warning(
-                    f"Image processing failed: {e}"
-                )
-
-                img_docs = []
-
-        # ─────────────────────────────────────
-
-        image_retriever = None
-
-        if img_docs:
-
-            with st.spinner(
-                "Building Image DB..."
-            ):
-
-                image_db = create_chroma_store(
+                img_db = create_chroma_store(
                     img_docs,
                     "pdf_images"
                 )
 
-                image_retriever = image_db.as_retriever(
+                image_retriever = img_db.as_retriever(
                     search_type="mmr",
-                    search_kwargs={"k": 1}
+                    search_kwargs={"k": 2}
                 )
 
         # ─────────────────────────────────────
 
-        pdf_retriever_tool = create_retriever_tool(
+        pdf_tool = create_retriever_tool(
             text_retriever,
             name="pdf_retriever",
-            description=(
-                "Search uploaded PDF content"
-            )
+            description="Retrieve information from uploaded PDF"
         )
 
-        image_retriever_tool = None
+        image_tool = None
 
         if image_retriever:
 
-            image_retriever_tool = create_retriever_tool(
+            image_tool = create_retriever_tool(
                 image_retriever,
                 name="image_retriever",
-                description=(
-                    "Retrieve diagrams and images "
-                    "from uploaded PDF"
-                )
+                description="Retrieve diagrams and images from PDF"
             )
 
         # ─────────────────────────────────────
 
-        with st.spinner("Building Agent..."):
+        with st.spinner("Building Agentic RAG Graph..."):
 
             st.session_state["graph"] = build_graph(
-                pdf_retriever_tool,
-                image_retriever_tool
+                pdf_tool,
+                image_tool
             )
 
-            st.session_state[
-                "image_retriever"
-            ] = image_retriever
+            st.session_state["image_retriever"] = image_retriever
 
             st.session_state["ready"] = True
 
@@ -719,35 +693,33 @@ if source_mode == "📄 PDF Upload":
 
 else:
 
-    url_input = st.text_input(
+    url = st.text_input(
         "Enter URL"
     )
 
-    if url_input and st.button("⚙️ Process URL"):
+    if url and st.button("Process URL"):
 
-        with st.spinner("Indexing URL..."):
+        with st.spinner("Loading URL..."):
 
-            url_retriever = build_url_retriever(
-                url_input
+            retriever = build_url_retriever(
+                url
             )
 
-        url_retriever_tool = create_retriever_tool(
-            url_retriever,
+        url_tool = create_retriever_tool(
+            retriever,
             name="url_retriever",
-            description=(
-                f"Search content from {url_input}"
+            description=f"Retrieve information from {url}"
+        )
+
+        with st.spinner("Building Graph..."):
+
+            st.session_state["graph"] = build_graph(
+                url_tool
             )
-        )
 
-        st.session_state["graph"] = build_graph(
-            url_retriever_tool
-        )
+            st.session_state["image_retriever"] = None
 
-        st.session_state[
-            "image_retriever"
-        ] = None
-
-        st.session_state["ready"] = True
+            st.session_state["ready"] = True
 
         st.success("✅ URL Ready!")
 
@@ -760,7 +732,7 @@ if st.session_state.get("ready"):
     st.divider()
 
     query = st.text_input(
-        "💬 Ask your question"
+        "Ask your question"
     )
 
     if query:
@@ -791,22 +763,16 @@ if st.session_state.get("ready"):
 
                 with cols[i % 3]:
 
-                    try:
+                    if img.startswith("http"):
 
-                        if img.startswith("http"):
-                            st.image(
-                                img,
-                                use_container_width=True
-                            )
+                        st.image(
+                            img,
+                            use_container_width=True
+                        )
 
-                        elif os.path.exists(img):
-                            st.image(
-                                img,
-                                use_container_width=True
-                            )
+                    elif os.path.exists(img):
 
-                    except Exception as e:
-
-                        st.caption(
-                            f"Image load failed: {e}"
+                        st.image(
+                            img,
+                            use_container_width=True
                         )
